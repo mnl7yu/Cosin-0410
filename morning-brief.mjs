@@ -12,13 +12,24 @@ const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID;
 // ─── Binance ─────────────────────────────────────────────────────────────────
 
 async function fetchCandles(symbol, limit = 500) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=${limit}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  return data.map(k => ({
-    time: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]),
-    low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]),
-  }));
+  // Binance US endpoint (GitHub Actions IP 차단 우회)
+  const urls = [
+    `https://api.binance.us/api/v3/klines?symbol=${symbol}&interval=1h&limit=${limit}`,
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=${limit}`,
+  ];
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        return data.map(k => ({
+          time: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]),
+          low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]),
+        }));
+      }
+    } catch {}
+  }
+  throw new Error(`${symbol} 캔들 데이터 수신 실패 (Binance IP 차단)`);
 }
 
 function calcEMA(closes, period) {
