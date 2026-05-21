@@ -229,7 +229,7 @@ async function analyzeSymbol(symbol) {
   const [candles1h, candles4h, candlesW, funding, oi] = await Promise.all([
     fetchCandles(symbol, "1h", 500),
     fetchCandles(symbol, "4h", 200),
-    fetchCandles(symbol, "1w", 60),
+    fetchCandles(symbol, "1w", 300),
     fetchFundingRate(symbol),
     fetchOpenInterest(symbol),
   ]);
