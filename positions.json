@@ -1,0 +1,16 @@
+[
+  {
+    "symbol": "ETHUSDT",
+    "side": "short",
+    "entryPrice": 2171.23,
+    "quantity": 0.004605684335607006,
+    "tradeSize": 10,
+    "leverage": 1,
+    "initialSl": 2193.4957142857143,
+    "trailStop": 2153.1714285714284,
+    "trailMult": 4,
+    "atr": 11.132857142857151,
+    "timestamp": "2026-05-16T18:31:37",
+    "orderId": "PAPER-1778923897187"
+  }
+]

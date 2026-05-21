@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "tradingview": {
+      "command": "node",
+      "args": ["/Users/henry/tradingview-mcp-jackson/src/server.js"],
+      "env": {
+        "CDP_PORT": "9222"
+      }
+    }
+  }
+}

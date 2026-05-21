@@ -78,6 +78,7 @@ const CONFIG = {
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
+  leverage: parseFloat(process.env.LEVERAGE || "1"),
   tradeMode: process.env.TRADE_MODE || "spot",
   bitget: {
     apiKey: process.env.BITGET_API_KEY,
@@ -88,6 +89,10 @@ const CONFIG = {
 };
 
 const LOG_FILE = "safety-check-log.json";
+const TZ = "Asia/Seoul";
+function localDate(d = new Date()) { return d.toLocaleDateString("sv", { timeZone: TZ }); }
+function localTime(d = new Date()) { return d.toLocaleTimeString("en-GB", { timeZone: TZ, hour12: false }); }
+function localISO(d = new Date()) { return `${localDate(d)}T${localTime(d)}`; }
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -101,7 +106,7 @@ function saveLog(log) {
 }
 
 function countTodaysTrades(log) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDate();
   return log.trades.filter(
     (t) => t.timestamp.startsWith(today) && t.orderPlaced,
   ).length;
@@ -112,15 +117,9 @@ function countTodaysTrades(log) {
 async function fetchCandles(symbol, interval, limit = 100) {
   // Map our timeframe format to Binance interval format
   const intervalMap = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1H": "1h",
-    "4H": "4h",
-    "1D": "1d",
-    "1W": "1w",
+    "1m": "1m", "3m": "3m", "5m": "5m",
+    "15m": "15m", "30m": "30m",
+    "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w",
   };
   const binanceInterval = intervalMap[interval] || "1m";
 
@@ -150,132 +149,152 @@ function calcEMA(closes, period) {
   return ema;
 }
 
-function calcRSI(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0,
-    losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
+function calcATR(candles, period = 14) {
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], p = candles[i - 1];
+    trs.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
   }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
+  return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 
-// VWAP — session-based, resets at midnight UTC
-function calcVWAP(candles) {
-  const midnightUTC = new Date();
-  midnightUTC.setUTCHours(0, 0, 0, 0);
-  const sessionCandles = candles.filter((c) => c.time >= midnightUTC.getTime());
-  if (sessionCandles.length === 0) return null;
-  const cumTPV = sessionCandles.reduce(
-    (sum, c) => sum + ((c.high + c.low + c.close) / 3) * c.volume,
-    0,
-  );
-  const cumVol = sessionCandles.reduce((sum, c) => sum + c.volume, 0);
-  return cumVol === 0 ? null : cumTPV / cumVol;
+// ADX(14) — Wilder's smoothing
+function calcADX(candles, period = 14) {
+  if (candles.length < period * 2 + 1) return null;
+  const trs = [], pDMs = [], mDMs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], p = candles[i - 1];
+    trs.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
+    const up = c.high - p.high, dn = p.low - c.low;
+    pDMs.push(up > dn && up > 0 ? up : 0);
+    mDMs.push(dn > up && dn > 0 ? dn : 0);
+  }
+  const wilder = (arr) => {
+    let s = arr.slice(0, period).reduce((a, b) => a + b, 0);
+    const r = [s];
+    for (let i = period; i < arr.length; i++) { s = s - s / period + arr[i]; r.push(s); }
+    return r;
+  };
+  const atrS = wilder(trs), pS = wilder(pDMs), mS = wilder(mDMs);
+  const dxArr = atrS.map((a, i) => {
+    const pdi = a > 0 ? 100 * pS[i] / a : 0;
+    const mdi = a > 0 ? 100 * mS[i] / a : 0;
+    const sum = pdi + mdi;
+    return sum > 0 ? 100 * Math.abs(pdi - mdi) / sum : 0;
+  });
+  // ADX: (prev*(period-1) + DX) / period — 0~100 범위 유지
+  // ATR/DM은 + arr[i] (Wilder sum), ADX는 + DX/period (Wilder mean)
+  if (dxArr.length < period) return null;
+  let adx = dxArr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dxArr.length; i++) { adx = (adx * (period - 1) + dxArr[i]) / period; }
+  return adx;
 }
 
-// ─── Safety Check ───────────────────────────────────────────────────────────
+// N봉 최고가/최저가 (마지막 봉 제외 — 돌파 확인용)
+function calcBreakoutLevels(candles, period = 2) {
+  const slice = candles.slice(-period - 1, -1); // 마지막 봉 제외
+  return {
+    hh: Math.max(...slice.map(c => c.high)),
+    ll: Math.min(...slice.map(c => c.low)),
+  };
+}
 
-function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
+// ─── Notifications ──────────────────────────────────────────────────────────
+
+async function sendNotification(title, message, subtitle = "") {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+
+  const text = subtitle
+    ? `${title}\n${subtitle}\n\n${message}`
+    : `${title}\n\n${message}`;
+
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+    });
+  } catch {
+    // Network error — skip silently
+  }
+}
+
+// ─── Strategy Check (Trend Following) ────────────────────────────────────────
+//
+// 조건 (롱):
+//   1. 주봉 EMA(50) 위 + 기울기 상승 (횡보장 필터)
+//   2. 4H EMA(50) 위 + 4H ADX(14) > adxThreshold (BTC=25, ETH=20)
+//   3. 30분봉 2봉 최고가 돌파 (브레이크아웃)
+// 숏은 위의 반대 (주봉 EMA 아래 + 기울기 하락일 때만)
+
+function runStrategyCheck({ price, high,
+  weeklyEma50, prevWeeklyEma50, h4Ema50, h4Adx,
+  hh2, ll2, adxThreshold }) {
+
   const results = [];
-
   const check = (label, required, actual, pass) => {
     results.push({ label, required, actual, pass });
-    const icon = pass ? "✅" : "🚫";
-    console.log(`  ${icon} ${label}`);
+    console.log(`  ${pass ? "✅" : "🚫"} ${label}`);
     console.log(`     Required: ${required} | Actual: ${actual}`);
   };
 
-  console.log("\n── Safety Check ─────────────────────────────────────────\n");
+  console.log("\n── Strategy Check (트렌드 추종) ─────────────────────────\n");
 
-  // Determine bias first
-  const bullishBias = price > vwap && price > ema8;
-  const bearishBias = price < vwap && price < ema8;
+  const weeklyBull = price > weeklyEma50;
+  const weeklyBear = price < weeklyEma50;
+  const wSlopeUp   = weeklyEma50 > prevWeeklyEma50;
+  const wSlopeDown = weeklyEma50 < prevWeeklyEma50;
+  const h4Bull     = price > h4Ema50;
+  const h4Bear     = price < h4Ema50;
+  const adxStrong  = h4Adx !== null && h4Adx > adxThreshold;
 
-  if (bullishBias) {
-    console.log("  Bias: BULLISH — checking long entry conditions\n");
+  // 방향 결정 (주봉 EMA 위치 + 기울기 모두 일치해야 방향 확정)
+  let direction = null;
+  if (weeklyBull && wSlopeUp && h4Bull) direction = "long";
+  else if (weeklyBear && wSlopeDown && h4Bear) direction = "short";
 
-    // 1. Price above VWAP
-    check(
-      "Price above VWAP (buyers in control)",
-      `> ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price > vwap,
-    );
+  const slopeArrow = wSlopeUp ? "↑ 상승" : "↓ 하락";
+  console.log(`  주봉 EMA(50): $${weeklyEma50.toFixed(2)} (기울기: ${slopeArrow}) → ${weeklyBull ? "위 (롱 바이어스)" : "아래 (숏 바이어스)"}`);
+  console.log(`  4H   EMA(50): $${h4Ema50.toFixed(2)} → ${h4Bull ? "위" : "아래"}`);
+  console.log(`  4H   ADX(14): ${h4Adx !== null ? h4Adx.toFixed(1) : "N/A"} → ${adxStrong ? `강한 추세 ✅ (>${adxThreshold})` : `약한 추세 🚫 (>${adxThreshold} 필요)`}`);
+  console.log(`  방향: ${direction === "long" ? "🟢 LONG" : direction === "short" ? "🔴 SHORT" : "⚪ NEUTRAL"}\n`);
 
-    // 2. Price above EMA(8)
-    check(
-      "Price above EMA(8) (uptrend confirmed)",
-      `> ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price > ema8,
-    );
-
-    // 3. RSI(3) pullback
-    check(
-      "RSI(3) below 30 (snap-back setup in uptrend)",
-      "< 30",
-      rsi3.toFixed(2),
-      rsi3 < 30,
-    );
-
-    // 4. Not overextended from VWAP
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
-  } else if (bearishBias) {
-    console.log("  Bias: BEARISH — checking short entry conditions\n");
-
-    check(
-      "Price below VWAP (sellers in control)",
-      `< ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price < vwap,
-    );
-
-    check(
-      "Price below EMA(8) (downtrend confirmed)",
-      `< ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price < ema8,
-    );
-
-    check(
-      "RSI(3) above 70 (reversal setup in downtrend)",
-      "> 70",
-      rsi3.toFixed(2),
-      rsi3 > 70,
-    );
-
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
-  } else {
-    console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
-    results.push({
-      label: "Market bias",
-      required: "Bullish or bearish",
-      actual: "Neutral",
-      pass: false,
-    });
+  if (!direction) {
+    results.push({ label: "주봉+4H 방향 일치", required: "동일 방향", actual: "불일치 (중립)", pass: false });
+    return { results, allPass: false, direction: null };
   }
 
+  const isLong = direction === "long";
+
+  // 1. 주봉 방향 + 기울기 필터 (횡보장 제외)
+  check(
+    `주봉 EMA(50) ${isLong ? "위 + 상승 기울기" : "아래 + 하락 기울기"} — 횡보 필터`,
+    isLong ? "위 & ↑ 상승" : "아래 & ↓ 하락",
+    `$${weeklyEma50.toFixed(2)} (${wSlopeUp ? "↑" : "↓"} ${weeklyEma50.toFixed(2)} vs ${prevWeeklyEma50.toFixed(2)})`,
+    isLong ? (weeklyBull && wSlopeUp) : (weeklyBear && wSlopeDown),
+  );
+
+  // 2. 4H 추세 강도
+  check(
+    `4H ADX(14) > ${adxThreshold} — 추세 강도 확인`,
+    `> ${adxThreshold}`,
+    h4Adx !== null ? h4Adx.toFixed(1) : "N/A",
+    adxStrong,
+  );
+
+  // 3. 30분봉 2봉 브레이크아웃
+  const breakoutHit = isLong ? (price > hh2) : (price < ll2);
+  check(
+    `30분봉 2봉 ${isLong ? "최고가" : "최저가"} 돌파 (브레이크아웃)`,
+    isLong ? `> $${hh2.toFixed(2)}` : `< $${ll2.toFixed(2)}`,
+    `$${price.toFixed(2)}`,
+    breakoutHit,
+  );
+
   const allPass = results.every((r) => r.pass);
-  return { results, allPass };
+  return { results, allPass, direction };
 }
 
 // ─── Trade Limits ────────────────────────────────────────────────────────────
@@ -315,6 +334,137 @@ function checkTradeLimits(log) {
   return true;
 }
 
+// ─── Position Tracking ───────────────────────────────────────────────────────
+
+const POSITIONS_FILE = "positions.json";
+
+function loadPositions() {
+  if (!existsSync(POSITIONS_FILE)) return [];
+  return JSON.parse(readFileSync(POSITIONS_FILE, "utf8"));
+}
+
+function savePositions(positions) {
+  writeFileSync(POSITIONS_FILE, JSON.stringify(positions, null, 2));
+}
+
+// ─── Exit Management (트레일링 스탑) ─────────────────────────────────────────
+//
+// 청산 우선순위:
+//   1. SL (initialSl): 가격이 SL에 도달 → 즉시 청산 (항상 1순위)
+//   2. Trail: 가격이 trailStop에 도달 → 청산
+//   3. 4H 추세 반전: 4H EMA(50) 반대편 이탈
+//
+// SL vs Trail 관계:
+//   [초기 구간] Trail이 SL 너머에 있음 → SL이 먼저 걸림 (손실 방어)
+//   [수익 구간] Trail이 SL 안쪽으로 진입 → Trail이 먼저 걸림 (수익 보호)
+//
+//   LONG:  SL = 진입 - ATR×slM (아래)  Trail = 진입 - ATR×trM → 상승하며 위로 이동
+//          Trail > SL 되면 → Trail이 먼저 걸림 (수익 확보)
+//   SHORT: SL = 진입 + ATR×slM (위)    Trail = 진입 + ATR×trM → 하락하며 아래로 이동
+//          Trail < SL 되면 → Trail이 먼저 걸림 (수익 확보)
+
+async function checkExits(currentPrice, currentHigh, currentLow, h4Bull, h4Bear, positions) {
+  if (positions.length === 0) return positions;
+
+  console.log("\n── Exit Check ───────────────────────────────────────────\n");
+
+  const updated = [];
+
+  for (const pos of positions) {
+    const isShort = pos.side === "short";
+    const pnlPct  = (isShort ? -1 : 1) * ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const fmt     = (v) => v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    console.log(`  ${pos.symbol} ${isShort ? "🔴 SHORT" : "🟢 LONG"} @ $${fmt(pos.entryPrice)}`);
+    console.log(`  현재가: $${fmt(currentPrice)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)`);
+
+    // 트레일 스탑 갱신
+    // LONG:  고점(currentHigh) 기준 — 올라갈수록 trail이 위로 이동
+    // SHORT: 저점(currentLow)  기준 — 내려갈수록 trail이 아래로 이동
+    const atr       = pos.atr ?? Math.abs(pos.entryPrice - pos.initialSl) / 2.0;
+    const trailMult = pos.trailMult ?? 4.0;
+    let trailStop   = pos.trailStop ?? pos.initialSl;
+
+    if (isShort) {
+      trailStop = Math.min(trailStop, currentLow + atr * trailMult);
+    } else {
+      trailStop = Math.max(trailStop, currentHigh - atr * trailMult);
+    }
+
+    // ── SL vs Trail 구간 표시 ──────────────────────────────
+    // LONG:  trail > sl  → Trail이 먼저 걸림 (수익 구간)
+    // SHORT: trail < sl  → Trail이 먼저 걸림 (수익 구간)
+    const trailFirst = isShort
+      ? trailStop < pos.initialSl   // SHORT: trail이 sl 아래
+      : trailStop > pos.initialSl;  // LONG:  trail이 sl 위
+
+    const slDist    = Math.abs(currentPrice - pos.initialSl);
+    const trailDist = Math.abs(currentPrice - trailStop);
+    const slPct     = (slDist / currentPrice * 100).toFixed(2);
+    const trailPct  = (trailDist / currentPrice * 100).toFixed(2);
+
+    if (trailFirst) {
+      console.log(`  📊 구간: [수익 보호] Trail($${fmt(trailStop)}) 먼저 걸림 — Trail까지 ${trailPct}%`);
+    } else {
+      console.log(`  📊 구간: [손실 방어] SL($${fmt(pos.initialSl)}) 먼저 걸림 — SL까지 ${slPct}%`);
+    }
+
+    // ── 청산 조건 확인 (우선순위: SL → Trail → 추세반전) ──
+    // SL/Trail 모두 봉 내 고점/저점 기준 — 종가가 복귀해도 터치 시 청산
+    //   SHORT: 봉 HIGH >= 레벨 (위로 터치)
+    //   LONG:  봉 LOW  <= 레벨 (아래로 터치)
+    const slHit     = isShort ? currentHigh >= pos.initialSl : currentLow  <= pos.initialSl;
+    const trailHit  = isShort ? currentHigh >= trailStop     : currentLow  <= trailStop;
+    const trendFlip = isShort ? h4Bull : h4Bear;
+
+    let exitReason = null;
+    if      (slHit)      exitReason = "SL: 초기 손절";
+    else if (trailHit)   exitReason = "TRAIL: 트레일링 스탑";
+    else if (trendFlip)  exitReason = "TREND FLIP: 4H 추세 반전";
+
+    if (exitReason) {
+      const exitPrice   = slHit ? pos.initialSl : trailHit ? trailStop : currentPrice;
+      const qty         = pos.quantity;
+      const realizedPnl = (isShort ? -1 : 1) * (exitPrice - pos.entryPrice) * qty * CONFIG.leverage;
+
+      console.log(`  🔴 청산 발동 — ${exitReason}`);
+      console.log(`  청산가: $${fmt(exitPrice)} | PnL: ${realizedPnl >= 0 ? "+" : ""}$${Math.abs(realizedPnl).toFixed(2)}`);
+
+      writeExitCsv(pos, exitPrice, exitReason, qty);
+
+      if (CONFIG.paperTrading) {
+        console.log(`  📋 PAPER: ${qty.toFixed(6)} ${pos.symbol} 청산 @ $${fmt(exitPrice)}`);
+      } else {
+        try {
+          await placeBitGetSellOrder(pos.symbol, qty, exitPrice);
+        } catch (err) {
+          console.log(`  ❌ 청산 실패: ${err.message}`);
+          updated.push({ ...pos, trailStop });
+          continue;
+        }
+      }
+
+      await sendNotification(
+        `${isShort ? "🔴" : "🟢"} ${pos.symbol} 청산 신호`,
+        [
+          `사유: ${exitReason}`,
+          `진입: $${fmt(pos.entryPrice)} → 청산가: $${fmt(exitPrice)}`,
+          `PnL: ${realizedPnl >= 0 ? "+" : ""}$${realizedPnl.toFixed(2)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)`,
+          ``,
+          `🔴 지금 BitGet에서 직접 청산하세요!`,
+        ].join("\n"),
+      );
+      continue;
+    }
+
+    // 홀딩 — trail 갱신 저장
+    console.log(`  ⏳ 홀딩 중 — 초기SL: $${fmt(pos.initialSl)} | Trail: $${fmt(trailStop)} | PnL: ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%`);
+    updated.push({ ...pos, trailStop });
+  }
+
+  return updated;
+}
+
 // ─── BitGet Execution ────────────────────────────────────────────────────────
 
 function signBitGet(timestamp, method, path, body = "") {
@@ -323,6 +473,40 @@ function signBitGet(timestamp, method, path, body = "") {
     .createHmac("sha256", CONFIG.bitget.secretKey)
     .update(message)
     .digest("base64");
+}
+
+async function placeBitGetSellOrder(symbol, quantity, price) {
+  const timestamp = Date.now().toString();
+  const path = "/api/v2/spot/trade/placeOrder";
+
+  const body = JSON.stringify({
+    symbol,
+    side: "sell",
+    orderType: "market",
+    quantity: quantity.toFixed(6),
+  });
+
+  const signature = signBitGet(timestamp, "POST", path, body);
+
+  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "ACCESS-KEY": CONFIG.bitget.apiKey,
+      "ACCESS-SIGN": signature,
+      "ACCESS-TIMESTAMP": timestamp,
+      "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
+    },
+    body,
+  });
+
+  const data = await res.json();
+  if (data.code !== "00000") {
+    throw new Error(`BitGet 매도 실패: ${data.msg}`);
+  }
+
+  console.log(`  ✅ 매도 주문 완료 — ${data.data.orderId}`);
+  return data.data;
 }
 
 async function placeBitGetOrder(symbol, side, sizeUSD, price) {
@@ -395,12 +579,33 @@ const CSV_HEADERS = [
   "Order ID",
   "Mode",
   "Notes",
+  "Realized PnL",
 ].join(",");
+
+function writeExitCsv(pos, exitPrice, exitType, qty) {
+  const now = new Date();
+  const date = localDate(now);
+  const time = localTime(now);
+  const isShort = pos.side === "short";
+  const realizedPnl = (isShort ? -1 : 1) * (exitPrice - pos.entryPrice) * qty * CONFIG.leverage;
+  const exitValue = exitPrice * qty;           // 실제 거래 금액 (수수료 계산용)
+  const totalUSD = (pos.tradeSize + realizedPnl).toFixed(2);  // 내 투자금 + 손익
+  const fee = (exitValue * 0.001).toFixed(4);
+  const exitSide = isShort ? "SHORT EXIT" : "LONG EXIT";
+  const row = [
+    date, time, "BitGet", pos.symbol, exitSide,
+    qty.toFixed(6), exitPrice.toFixed(2), totalUSD,
+    fee, (parseFloat(totalUSD) - parseFloat(fee)).toFixed(2),
+    pos.orderId, CONFIG.paperTrading ? "PAPER" : "LIVE",
+    `"${exitType}"`, realizedPnl.toFixed(4),
+  ].join(",");
+  appendFileSync(CSV_FILE, row + "\n");
+}
 
 function writeTradeCsv(logEntry) {
   const now = new Date(logEntry.timestamp);
-  const date = now.toISOString().slice(0, 10);
-  const time = now.toISOString().slice(11, 19);
+  const date = localDate(now);
+  const time = localTime(now);
 
   let side = "";
   let quantity = "";
@@ -420,16 +625,16 @@ function writeTradeCsv(logEntry) {
     orderId = "BLOCKED";
     notes = `Failed: ${failed}`;
   } else if (logEntry.paperTrading) {
-    side = "BUY";
+    side = logEntry.direction === "short" ? "SHORT" : "LONG";
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
     fee = (logEntry.tradeSize * 0.001).toFixed(4);
     netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
     orderId = logEntry.orderId || "";
     mode = "PAPER";
-    notes = "All conditions met";
+    notes = logEntry.notes || "All conditions met";
   } else {
-    side = "BUY";
+    side = logEntry.direction === "short" ? "SHORT" : "LONG";
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
     fee = (logEntry.tradeSize * 0.001).toFixed(4);
@@ -491,6 +696,188 @@ function generateTaxSummary() {
   console.log("─────────────────────────────────────────────────────────\n");
 }
 
+// ─── Per-Symbol Logic ────────────────────────────────────────────────────────
+
+async function runForSymbol(symbol, log) {
+  console.log(`\n${"─".repeat(57)}`);
+  console.log(`  ${symbol}`);
+  console.log(`${"─".repeat(57)}`);
+
+  console.log("\n── 시장 데이터 수집 (Binance) ──────────────────────────\n");
+
+  // 심볼별 ADX 임계값 (백테스트 최적값: BTC=25, ETH=20)
+  const adxThreshold = symbol === "BTCUSDT" ? 25 : 20;
+
+  // 네 타임프레임 동시 수집
+  const [candles1h, candles4h, candlesW, candles30m] = await Promise.all([
+    fetchCandles(symbol, "1H", 200),   // 1H: 진입 신호 / ATR
+    fetchCandles(symbol, "4H", 200),   // 4H: 추세 방향 + ADX
+    fetchCandles(symbol, "1W", 100),   // 주봉: 바이어스 필터
+    fetchCandles(symbol, "30m", 10),   // 30분봉: 2봉 브레이크아웃
+  ]);
+
+  const price  = candles1h.at(-1).close;
+  const high1h = candles1h.at(-1).high;
+  const low1h  = candles1h.at(-1).low;
+
+  // 지표 계산
+  const weeklyCloses    = candlesW.map(c => c.close);
+  const weeklyEma50     = calcEMA(weeklyCloses, 50);
+  const prevWeeklyEma50 = calcEMA(weeklyCloses.slice(0, -1), 50);  // 기울기 계산용 (전봉)
+  const h4Ema50         = calcEMA(candles4h.map(c => c.close), 50);
+  const h4Adx       = calcADX(candles4h, 14);
+  const atr1h       = calcATR(candles1h, 14);
+  const { hh: hh2_30m, ll: ll2_30m } = calcBreakoutLevels(candles30m, 2);
+
+  const h4Bull = price > h4Ema50;
+  const h4Bear = price < h4Ema50;
+
+  console.log(`  현재가 (1H):      $${price.toFixed(2)}`);
+  const slopeArrow = weeklyEma50 > prevWeeklyEma50 ? "↑" : "↓";
+  console.log(`  주봉 EMA(50):    $${weeklyEma50.toFixed(2)} (기울기: ${slopeArrow})`);
+  console.log(`  4H EMA(50):     $${h4Ema50.toFixed(2)}`);
+  console.log(`  4H ADX(14):     ${h4Adx !== null ? h4Adx.toFixed(1) : "N/A"} (임계값 >${adxThreshold})`);
+  console.log(`  1H ATR(14):     $${atr1h.toFixed(2)}`);
+  console.log(`  30m 2봉 최고가:  $${hh2_30m.toFixed(2)}`);
+  console.log(`  30m 2봉 최저가:  $${ll2_30m.toFixed(2)}`);
+
+  // 포지션 청산 체크 (먼저 실행)
+  const positions    = loadPositions().filter(p => p.symbol === symbol);
+  const allOther     = loadPositions().filter(p => p.symbol !== symbol);
+  const updPositions = await checkExits(price, high1h, low1h, h4Bull, h4Bear, positions);
+  savePositions([...allOther, ...updPositions]);
+
+  // 전략 체크
+  const { results, allPass, direction } = runStrategyCheck({
+    price, high: high1h,
+    weeklyEma50, prevWeeklyEma50, h4Ema50, h4Adx,
+    hh2: hh2_30m, ll2: ll2_30m,
+    adxThreshold,
+  });
+
+  const tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
+  const fmt = (v) => v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  console.log("\n── Decision ─────────────────────────────────────────────\n");
+
+  const logEntry = {
+    timestamp: localISO(),
+    symbol,
+    price,
+    indicators: { weeklyEma50, prevWeeklyEma50, h4Ema50, h4Adx, atr1h, hh2_30m, ll2_30m, adxThreshold },
+    conditions: results,
+    allPass,
+    direction,
+    tradeSize,
+    orderPlaced: false,
+    orderId: null,
+    paperTrading: CONFIG.paperTrading,
+  };
+
+  if (!allPass) {
+    const failed = results.filter(r => !r.pass).map(r => r.label);
+    console.log(`🚫 TRADE BLOCKED`);
+    failed.forEach(f => console.log(`   - ${f}`));
+  } else {
+    const isLong    = direction === "long";
+    const dirLabel  = isLong ? "🟢 LONG" : "🔴 SHORT";
+    const weeklyBull = price > weeklyEma50;
+    // 주봉 강세장 롱: Trail×6.0 / SL×3.0 → 파라볼릭 무브 대응
+    // 나머지 (하락장 숏 등): Trail×4.0 / SL×2.0
+    const slMult    = isLong && weeklyBull ? 3.0 : 2.0;
+    const trailMult = isLong && weeklyBull ? 6.0 : 4.0;
+    const initialSl = isLong
+      ? price - atr1h * slMult
+      : price + atr1h * slMult;
+    const trailStop = isLong
+      ? price - atr1h * trailMult
+      : price + atr1h * trailMult;
+    const slPct = Math.abs((initialSl - price) / price * 100).toFixed(2);
+
+    console.log(`✅ ALL CONDITIONS MET — ${dirLabel} 진입`);
+
+    const entryMsg = [
+      `${dirLabel} 진입 신호 — ${symbol}`,
+      ``,
+      `진입가:     $${fmt(price)}`,
+      `4H ADX:    ${h4Adx !== null ? h4Adx.toFixed(1) : "N/A"} (추세 강도)`,
+      `주봉 바이어스: ${price > weeklyEma50 ? "상승 ▲" : "하락 ▼"}`,
+      `30m BK:    ${isLong ? `$${fmt(hh2_30m)} 돌파 (2봉 30분봉)` : `$${fmt(ll2_30m)} 하향 돌파 (2봉 30분봉)`}`,
+      ``,
+      `🛑 초기 손절: $${fmt(initialSl)} (-${slPct}%, ATR×${slMult.toFixed(1)})`,
+      `🔄 트레일링: ATR×${trailMult.toFixed(1)} 기준 갱신${isLong && weeklyBull ? " (주봉 강세장 모드)" : ""}`,
+      ``,
+      `모드: ${CONFIG.paperTrading ? "페이퍼" : "실거래"}`,
+    ].join("\n");
+
+    console.log(`\n  ${dirLabel} ALERT: ${symbol} @ $${fmt(price)}`);
+    console.log(`  초기 손절: $${fmt(initialSl)} | ATR: $${atr1h.toFixed(2)}`);
+    await sendNotification(`${dirLabel} ${symbol} 진입 신호!`, entryMsg);
+
+    // 포지션 열기
+    let fresh = loadPositions();
+    const existing     = fresh.filter(p => p.symbol === symbol);
+    const oppositeSide = existing.filter(p => p.side !== direction);
+    const sameSide     = existing.filter(p => p.side === direction);
+
+    // 반대 방향 → 청산
+    if (oppositeSide.length > 0) {
+      for (const pos of oppositeSide) {
+        const pnl = (pos.side === "long" ? 1 : -1) * (price - pos.entryPrice) * pos.quantity;
+        writeExitCsv(pos, price, `반대 시그널 → ${direction.toUpperCase()}`, pos.quantity);
+        console.log(`  🔄 반대 포지션 청산: $${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`);
+      }
+      fresh = fresh.filter(p => !oppositeSide.includes(p));
+    }
+
+    if (sameSide.length > 0) {
+      console.log(`\n⏭ ${symbol} ${direction.toUpperCase()} 이미 오픈 — 중복 스킵`);
+      logEntry.notes = "skipped: same direction position already open";
+    } else {
+      const qty = tradeSize / price;
+      logEntry.orderPlaced = true;
+      logEntry.orderId = `PAPER-${Date.now()}`;
+
+      if (CONFIG.paperTrading) {
+        console.log(`\n📋 PAPER: ${qty.toFixed(6)} ${symbol} @ $${fmt(price)}`);
+        console.log(`   초기SL: $${fmt(initialSl)} | 트레일 시작: $${fmt(trailStop)}`);
+      } else {
+        try {
+          const order = await placeBitGetOrder(symbol, isLong ? "buy" : "sell", tradeSize, price);
+          logEntry.orderId = order.orderId;
+          console.log(`✅ ORDER PLACED — ${order.orderId}`);
+        } catch (err) {
+          console.log(`❌ ORDER FAILED — ${err.message}`);
+          logEntry.error = err.message;
+          logEntry.orderPlaced = false;
+        }
+      }
+
+      if (logEntry.orderPlaced) {
+        fresh.push({
+          symbol,
+          side: direction,
+          entryPrice: price,
+          quantity: qty,
+          tradeSize,
+          leverage: CONFIG.leverage,
+          initialSl,
+          trailStop,
+          trailMult,
+          atr: atr1h,
+          timestamp: localISO(),
+          orderId: logEntry.orderId,
+        });
+        savePositions(fresh);
+      }
+    }
+  }
+
+  log.trades.push(logEntry);
+  saveLog(log);
+  writeTradeCsv(logEntry);
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function run() {
@@ -498,16 +885,17 @@ async function run() {
   initCsv();
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot");
-  console.log(`  ${new Date().toISOString()}`);
+  console.log(`  ${localISO()}`);
   console.log(
     `  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`,
   );
   console.log("═══════════════════════════════════════════════════════════");
 
-  // Load strategy
+  // Load strategy and watchlist
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
+  const watchlist = rules.watchlist || [CONFIG.symbol];
   console.log(`\nStrategy: ${rules.strategy.name}`);
-  console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
+  console.log(`Watchlist: ${watchlist.join(", ")} | Timeframe: ${CONFIG.timeframe}`);
 
   // Load log and check daily limits
   const log = loadLog();
@@ -517,103 +905,12 @@ async function run() {
     return;
   }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
-  const closes = candles.map((c) => c.close);
-  const price = closes[closes.length - 1];
-  console.log(`  Current price: $${price.toFixed(2)}`);
-
-  // Calculate indicators
-  const ema8 = calcEMA(closes, 8);
-  const vwap = calcVWAP(candles);
-  const rsi3 = calcRSI(closes, 3);
-
-  console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
-  console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
-
-  if (!vwap || !rsi3) {
-    console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
-    return;
+  // Run for each symbol in sequence
+  for (const symbol of watchlist) {
+    await runForSymbol(symbol, log, rules);
   }
 
-  // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
-
-  // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
-
-  // Decision
-  console.log("\n── Decision ─────────────────────────────────────────────\n");
-
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    symbol: CONFIG.symbol,
-    timeframe: CONFIG.timeframe,
-    price,
-    indicators: { ema8, vwap, rsi3 },
-    conditions: results,
-    allPass,
-    tradeSize,
-    orderPlaced: false,
-    orderId: null,
-    paperTrading: CONFIG.paperTrading,
-    limits: {
-      maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
-      maxTradesPerDay: CONFIG.maxTradesPerDay,
-      tradesToday: countTodaysTrades(log),
-    },
-  };
-
-  if (!allPass) {
-    const failed = results.filter((r) => !r.pass).map((r) => r.label);
-    console.log(`🚫 TRADE BLOCKED`);
-    console.log(`   Failed conditions:`);
-    failed.forEach((f) => console.log(`   - ${f}`));
-  } else {
-    console.log(`✅ ALL CONDITIONS MET`);
-
-    if (CONFIG.paperTrading) {
-      console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
-      );
-      console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
-      logEntry.orderPlaced = true;
-      logEntry.orderId = `PAPER-${Date.now()}`;
-    } else {
-      console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
-      );
-      try {
-        const order = await placeBitGetOrder(
-          CONFIG.symbol,
-          "buy",
-          tradeSize,
-          price,
-        );
-        logEntry.orderPlaced = true;
-        logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
-      } catch (err) {
-        console.log(`❌ ORDER FAILED — ${err.message}`);
-        logEntry.error = err.message;
-      }
-    }
-  }
-
-  // Save decision log
-  log.trades.push(logEntry);
-  saveLog(log);
-  console.log(`\nDecision log saved → ${LOG_FILE}`);
-
-  // Write tax CSV row for every run (executed, paper, or blocked)
-  writeTradeCsv(logEntry);
-
-  console.log("═══════════════════════════════════════════════════════════\n");
+  console.log("\n═══════════════════════════════════════════════════════════\n");
 }
 
 if (process.argv.includes("--tax-summary")) {

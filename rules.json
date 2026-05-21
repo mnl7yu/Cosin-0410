@@ -1,33 +1,36 @@
 {
-  "watchlist": ["BTCUSDT"],
+  "watchlist": ["BTCUSDT", "ETHUSDT"],
   "default_timeframe": "1m",
 
   "strategy": {
-    "name": "VWAP + RSI(3) + EMA(8) Scalping Strategy",
-    "sources": ["Lewis Jackson"],
-    "description": "Three indicators, each doing a different job. EMA(8) for trend direction, VWAP for session bias, RSI(3) for entry timing. All three must align before a trade fires."
+    "name": "VWAP + RSI(3) + EMA(8/21) Scalping Strategy",
+    "sources": ["Lewis Jackson", "EMA(21) Trend Filter"],
+    "description": "Four indicators, each doing a different job. EMA(8) for short-term momentum, EMA(21) for medium-term trend confirmation, VWAP for session bias, RSI(3) for entry timing. All four must align before a trade fires."
   },
 
   "indicators": {
-    "ema_8": "Trend direction. Price above EMA(8) = bullish momentum. Below = bearish.",
-    "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC.",
-    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
+    "ema_8": "단기 추세. 현재가가 EMA(8) 위 = 단기 상승. 아래 = 단기 하락.",
+    "ema_21": "중기 추세 필터. 현재가가 EMA(21) 위 = 중기 상승추세 확인. 아래 = 중기 하락추세 확인. 노이즈 필터 역할.",
+    "vwap": "세션 바이어스. 현재가가 VWAP 위 = 매수세 우위. 아래 = 매도세 우위. 매일 자정(UTC) 리셋.",
+    "rsi_3": "진입 타이밍. RSI 3캔들 기준 — 매우 민감. 상승추세 중 30 이하 = 눌림목 반등 셋업. 하락추세 중 70 이상 = 반전 가능성."
   },
 
   "bias_criteria": {
-    "bullish": ["Price is above VWAP", "Price is above EMA(8)"],
-    "bearish": ["Price is below VWAP", "Price is below EMA(8)"]
+    "bullish": ["Price is above VWAP", "Price is above EMA(8)", "Price is above EMA(21)"],
+    "bearish": ["Price is below VWAP", "Price is below EMA(8)", "Price is below EMA(21)"]
   },
 
   "entry_rules": {
     "long": [
       "Price is above VWAP — buyers in control for the session",
-      "Price is above EMA(8) — uptrend confirmed",
+      "Price is above EMA(8) — short-term uptrend confirmed",
+      "Price is above EMA(21) — medium-term uptrend confirmed (noise filter)",
       "RSI(3) has dropped below 30 — short-term pullback in an uptrend, snap-back likely"
     ],
     "short": [
       "Price is below VWAP — sellers in control",
-      "Price is below EMA(8) — downtrend confirmed",
+      "Price is below EMA(8) — short-term downtrend confirmed",
+      "Price is below EMA(21) — medium-term downtrend confirmed (noise filter)",
       "RSI(3) has spiked above 70 — overbought in a downtrend, reversal likely"
     ]
   },
