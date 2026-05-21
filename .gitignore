@@ -1,4 +1,5 @@
 .env
 *.log
+.claude/
 safety-check-log.json
 node_modules/
