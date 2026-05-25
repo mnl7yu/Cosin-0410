@@ -22,16 +22,19 @@ async function fetchCandles(symbol, interval = "1h", limit = 500) {
     `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
   ];
   for (const url of urls) {
-    try {
-      const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        return data.map(k => ({
-          time: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]),
-          low:  parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]),
-        }));
-      }
-    } catch {}
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 2000 * attempt));
+        const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          return data.map(k => ({
+            time: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]),
+            low:  parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]),
+          }));
+        }
+      } catch {}
+    }
   }
   throw new Error(`${symbol} ${interval} 캔들 수신 실패`);
 }
@@ -483,4 +486,9 @@ async function main() {
   await sendTelegram(text);
 }
 
-main().catch(console.error);
+main().catch(async (err) => {
+  console.error(err);
+  // 실패해도 텔레그램으로 알림
+  const now = new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul", timeStyle: "short" });
+  await sendTelegram(`⚠️ 브리핑 실패  |  ${now}\n오류: ${err.message}\n\n잠시 후 수동으로 확인하세요.`).catch(() => {});
+});

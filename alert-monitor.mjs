@@ -24,18 +24,21 @@ async function fetchCandles(symbol, limit = 25) {
     `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=${limit}`,
   ];
   for (const url of urls) {
-    try {
-      const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        return data.map(k => ({
-          openTime: k[0],
-          open: parseFloat(k[1]), high: parseFloat(k[2]),
-          low:  parseFloat(k[3]), close: parseFloat(k[4]),
-          volume: parseFloat(k[5]),
-        }));
-      }
-    } catch {}
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 2000 * attempt));
+        const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          return data.map(k => ({
+            openTime: k[0],
+            open: parseFloat(k[1]), high: parseFloat(k[2]),
+            low:  parseFloat(k[3]), close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
+          }));
+        }
+      } catch {}
+    }
   }
   return null;
 }
