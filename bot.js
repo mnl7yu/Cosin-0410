@@ -112,24 +112,50 @@ function countTodaysTrades(log) {
   ).length;
 }
 
-// ─── Market Data (Binance public API — free, no auth) ───────────────────────
+// ─── Market Data (OKX public API — free, no auth) ───────────────────────────
+
+function toOkxSymbol(symbol) {
+  // BTCUSDT → BTC-USDT, ETHUSDT → ETH-USDT
+  return symbol.replace(/^([A-Z]+)(USDT)$/, "$1-USDT");
+}
 
 async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
-  const intervalMap = {
+  // OKX bar format: 1m 3m 5m 15m 30m 1H 4H 1D 1W
+  const barMap = {
     "1m": "1m", "3m": "3m", "5m": "5m",
     "15m": "15m", "30m": "30m",
-    "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w",
+    "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W",
   };
-  const binanceInterval = intervalMap[interval] || "1m";
+  const bar = barMap[interval] || "1H";
+  const instId = toOkxSymbol(symbol);
 
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
-  const data = await res.json();
+  // OKX max 300 per request; fetch in pages if limit > 300
+  const candles = [];
+  let after = "";
+  let remaining = limit;
 
-  return data.map((k) => ({
-    time: k[0],
+  while (remaining > 0) {
+    const batchSize = Math.min(remaining, 300);
+    const params = new URLSearchParams({ instId, bar, limit: batchSize });
+    if (after) params.set("after", after);
+    const url = `https://www.okx.com/api/v5/market/candles?${params}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`OKX API error: ${res.status}`);
+    const json = await res.json();
+    if (json.code !== "0") throw new Error(`OKX error: ${json.msg}`);
+    const batch = json.data;
+    if (!batch || batch.length === 0) break;
+    candles.push(...batch);
+    remaining -= batch.length;
+    if (batch.length < batchSize) break;
+    after = batch[batch.length - 1][0]; // oldest timestamp for next page
+  }
+
+  // OKX returns newest-first — reverse to oldest-first (same as Binance)
+  candles.reverse();
+
+  return candles.map((k) => ({
+    time: parseInt(k[0]),
     open: parseFloat(k[1]),
     high: parseFloat(k[2]),
     low: parseFloat(k[3]),
@@ -228,6 +254,22 @@ async function sendNotification(title, message, subtitle = "") {
 //   2. 4H EMA(50) 위 + 4H ADX(14) > adxThreshold (BTC=25, ETH=20)
 //   3. 30분봉 2봉 최고가 돌파 (브레이크아웃)
 // 숏은 위의 반대 (주봉 EMA 아래 + 기울기 하락일 때만)
+//
+// ── backtest-v2 결과 (1H × 2000봉 ≈ 83일, 2024-05 기준) ────────────────────
+//
+//   BTCUSDT: Baseline PnL +30.5%  PF 9.58  (baseline 우세)
+//   ETHUSDT: Baseline PnL +11.5%  PF 2.74  (baseline 우세)
+//
+//   피처 검증 결과:
+//     ❌ dynamic-atr  : BTC ±0%,   ETH -1.8%   → 효과 없음
+//     ❌ funding-rate : 두 심볼 모두 필터 임계값 미달 → 효과 없음
+//     ❌ rsi-div      : BTC -20.9%, ETH -5.5%   → 조기 청산 증가로 성능 저하
+//     ❌ tp1 (신규)   : BTC -25.0%, ETH -7.2%   → 대형 추세 손절로 성능 저하
+//                       (기존 TP1은 유지 — 이전 세션 결과 보존용)
+//     ❌ pyramid      : BTC -20.7%, ETH -7.8%   → tp1과 함께 성능 저하
+//
+//   결론: 현재 베이스라인 로직이 모든 피처보다 우수.
+//         강한 추세 시장에서 큰 trail multiplier(×6)가 더 유리함.
 
 function runStrategyCheck({ price, high,
   weeklyEma50, prevWeeklyEma50, h4Ema50, h4Adx,
@@ -347,21 +389,22 @@ function savePositions(positions) {
   writeFileSync(POSITIONS_FILE, JSON.stringify(positions, null, 2));
 }
 
-// ─── Exit Management (트레일링 스탑) ─────────────────────────────────────────
+// ─── Exit Management ─────────────────────────────────────────────────────────
 //
 // 청산 우선순위:
 //   1. SL (initialSl): 가격이 SL에 도달 → 즉시 청산 (항상 1순위)
-//   2. Trail: 가격이 trailStop에 도달 → 청산
-//   3. 4H 추세 반전: 4H EMA(50) 반대편 이탈
+//   2. SIGNAL FADE: 진입 후 첫 3번 체크 동안 브레이크아웃 레벨 역방향 이탈
+//   3. TRAIL: 트레일링 스탑 도달
+//   4. TREND FLIP: 4H EMA(50) 반대편 이탈
+//
+// TP1 분할 익절 없음 — backtest-v2 결과 강한 추세장에서 수익 25% 감소 확인 → 제거
 //
 // SL vs Trail 관계:
 //   [초기 구간] Trail이 SL 너머에 있음 → SL이 먼저 걸림 (손실 방어)
 //   [수익 구간] Trail이 SL 안쪽으로 진입 → Trail이 먼저 걸림 (수익 보호)
 //
 //   LONG:  SL = 진입 - ATR×slM (아래)  Trail = 진입 - ATR×trM → 상승하며 위로 이동
-//          Trail > SL 되면 → Trail이 먼저 걸림 (수익 확보)
 //   SHORT: SL = 진입 + ATR×slM (위)    Trail = 진입 + ATR×trM → 하락하며 아래로 이동
-//          Trail < SL 되면 → Trail이 먼저 걸림 (수익 확보)
 
 async function checkExits(currentPrice, currentHigh, currentLow, h4Bull, h4Bear, positions) {
   if (positions.length === 0) return positions;
@@ -391,12 +434,34 @@ async function checkExits(currentPrice, currentHigh, currentLow, h4Bull, h4Bear,
       trailStop = Math.max(trailStop, currentHigh - atr * trailMult);
     }
 
+    // 체크 카운터 증가 (신호 소멸 판단용)
+    const checkCount = (pos.entryCheckCount ?? 0) + 1;
+
+    // ── 1순위: SL ─────────────────────────────────────────
+    const slHit = isShort ? currentHigh >= pos.initialSl : currentLow <= pos.initialSl;
+    if (slHit) {
+      const exitPrice   = pos.initialSl;
+      const qty         = pos.quantity;
+      const realizedPnl = (isShort ? -1 : 1) * (exitPrice - pos.entryPrice) * qty * CONFIG.leverage;
+      console.log(`  🔴 청산 발동 — SL: 초기 손절`);
+      console.log(`  청산가: $${fmt(exitPrice)} | PnL: $${realizedPnl.toFixed(2)}`);
+      writeExitCsv(pos, exitPrice, "SL: 초기 손절", qty);
+      if (CONFIG.paperTrading) {
+        console.log(`  📋 PAPER: ${qty.toFixed(6)} ${pos.symbol} 청산 @ $${fmt(exitPrice)}`);
+      } else {
+        try { await placeBitGetSellOrder(pos.symbol, qty, exitPrice); }
+        catch (err) { console.log(`  ❌ 청산 실패: ${err.message}`); updated.push({ ...pos, trailStop, entryCheckCount: checkCount }); continue; }
+      }
+      await sendNotification(`${isShort ? "🔴" : "🟢"} ${pos.symbol} 청산 신호`,
+        [`사유: SL: 초기 손절`, `진입: $${fmt(pos.entryPrice)} → 청산가: $${fmt(exitPrice)}`,
+         `PnL: $${realizedPnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`, ``, `🔴 지금 BitGet에서 직접 청산하세요!`].join("\n"));
+      continue;
+    }
+
     // ── SL vs Trail 구간 표시 ──────────────────────────────
-    // LONG:  trail > sl  → Trail이 먼저 걸림 (수익 구간)
-    // SHORT: trail < sl  → Trail이 먼저 걸림 (수익 구간)
     const trailFirst = isShort
-      ? trailStop < pos.initialSl   // SHORT: trail이 sl 아래
-      : trailStop > pos.initialSl;  // LONG:  trail이 sl 위
+      ? trailStop < pos.initialSl
+      : trailStop > pos.initialSl;
 
     const slDist    = Math.abs(currentPrice - pos.initialSl);
     const trailDist = Math.abs(currentPrice - trailStop);
@@ -409,21 +474,25 @@ async function checkExits(currentPrice, currentHigh, currentLow, h4Bull, h4Bear,
       console.log(`  📊 구간: [손실 방어] SL($${fmt(pos.initialSl)}) 먼저 걸림 — SL까지 ${slPct}%`);
     }
 
-    // ── 청산 조건 확인 (우선순위: SL → Trail → 추세반전) ──
-    // SL/Trail 모두 봉 내 고점/저점 기준 — 종가가 복귀해도 터치 시 청산
-    //   SHORT: 봉 HIGH >= 레벨 (위로 터치)
-    //   LONG:  봉 LOW  <= 레벨 (아래로 터치)
-    const slHit     = isShort ? currentHigh >= pos.initialSl : currentLow  <= pos.initialSl;
-    const trailHit  = isShort ? currentHigh >= trailStop     : currentLow  <= trailStop;
+    // ── 3순위: 신호 소멸 — 진입 후 첫 3번 체크 동안만 ─────
+    // 브레이크아웃 후 가격이 돌파 레벨 반대로 복귀 = 가짜 브레이크아웃
+    const earlyPhase = checkCount <= 3 && pos.breakoutLevel != null;
+    const signalFade = earlyPhase && (
+      isShort ? currentPrice > pos.breakoutLevel : currentPrice < pos.breakoutLevel
+    );
+
+    // ── 4순위: Trail / 5순위: Trend Flip ──────────────────
+    // close 기준 감지 — 백테스트 정합성 유지, 일봉 내 wick에 의한 가짜 청산 방지
+    const trailHit  = isShort ? currentPrice >= trailStop : currentPrice <= trailStop;
     const trendFlip = isShort ? h4Bull : h4Bear;
 
     let exitReason = null;
-    if      (slHit)      exitReason = "SL: 초기 손절";
+    if      (signalFade) exitReason = "SIGNAL FADE: 브레이크아웃 되돌림";
     else if (trailHit)   exitReason = "TRAIL: 트레일링 스탑";
     else if (trendFlip)  exitReason = "TREND FLIP: 4H 추세 반전";
 
     if (exitReason) {
-      const exitPrice   = slHit ? pos.initialSl : trailHit ? trailStop : currentPrice;
+      const exitPrice   = trailHit ? trailStop : currentPrice;
       const qty         = pos.quantity;
       const realizedPnl = (isShort ? -1 : 1) * (exitPrice - pos.entryPrice) * qty * CONFIG.leverage;
 
@@ -439,7 +508,7 @@ async function checkExits(currentPrice, currentHigh, currentLow, h4Bull, h4Bear,
           await placeBitGetSellOrder(pos.symbol, qty, exitPrice);
         } catch (err) {
           console.log(`  ❌ 청산 실패: ${err.message}`);
-          updated.push({ ...pos, trailStop });
+          updated.push({ ...pos, trailStop, entryCheckCount: checkCount });
           continue;
         }
       }
@@ -459,7 +528,7 @@ async function checkExits(currentPrice, currentHigh, currentLow, h4Bull, h4Bear,
 
     // 홀딩 — trail 갱신 저장
     console.log(`  ⏳ 홀딩 중 — 초기SL: $${fmt(pos.initialSl)} | Trail: $${fmt(trailStop)} | PnL: ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%`);
-    updated.push({ ...pos, trailStop });
+    updated.push({ ...pos, trailStop, entryCheckCount: checkCount });
   }
 
   return updated;
@@ -805,7 +874,7 @@ async function runForSymbol(symbol, log) {
       `30m BK:    ${isLong ? `$${fmt(hh2_30m)} 돌파 (2봉 30분봉)` : `$${fmt(ll2_30m)} 하향 돌파 (2봉 30분봉)`}`,
       ``,
       `🛑 초기 손절: $${fmt(initialSl)} (-${slPct}%, ATR×${slMult.toFixed(1)})`,
-      `🔄 트레일링: ATR×${trailMult.toFixed(1)} 기준 갱신${isLong && weeklyBull ? " (주봉 강세장 모드)" : ""}`,
+      `🔄 트레일링: ATR×${trailMult.toFixed(1)} 기준 갱신`,
       ``,
       `모드: ${CONFIG.paperTrading ? "페이퍼" : "실거래"}`,
     ].join("\n");
@@ -867,6 +936,8 @@ async function runForSymbol(symbol, log) {
           atr: atr1h,
           timestamp: localISO(),
           orderId: logEntry.orderId,
+          breakoutLevel: isLong ? hh2_30m : ll2_30m,
+          entryCheckCount: 0,
         });
         savePositions(fresh);
       }

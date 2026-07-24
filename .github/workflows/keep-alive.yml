@@ -1,0 +1,27 @@
+name: Keep Alive
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"   # 매월 1일 자동 실행
+  workflow_dispatch:        # 수동 실행 버튼
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 빈 커밋으로 워크플로우 비활성화 방지
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git commit --allow-empty -m "chore: keep workflows alive [skip ci]"
+          git push
+
+      - name: 특이사항 알림 워크플로우 활성화 유지
+        run: |
+          echo "✅ 특이사항 알림 워크플로우 활성 유지"
+          echo "✅ 브리핑 워크플로우 활성 유지"
+          echo "다음 실행: $(date -d '+1 month' '+%Y-%m-%d' 2>/dev/null || date -v+1m '+%Y-%m-%d')"

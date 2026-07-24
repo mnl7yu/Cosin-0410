@@ -14,15 +14,43 @@ import crypto from "crypto";
 
 const PORT = 3000;
 
-// ─── Binance Market Data ─────────────────────────────────────────────────────
+// ─── OKX Market Data ─────────────────────────────────────────────────────────
 
-async function fetchCandles(symbol, interval = "1h", limit = 200) {
-  const map = { "1h": "1h", "30m": "30m", "4h": "4h", "1w": "1w", "1d": "1d" };
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${map[interval] ?? interval}&limit=${limit}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  return data.map((k) => ({
-    time: k[0],
+function toOkxSymbol(symbol) {
+  return symbol.replace(/^([A-Z]+)(USDT)$/, "$1-USDT");
+}
+
+async function fetchCandles(symbol, interval = "1H", limit = 200) {
+  const barMap = { "1h": "1H", "30m": "30m", "4h": "4H", "1w": "1W", "1d": "1D",
+                   "1H": "1H", "4H": "4H", "1W": "1W", "1D": "1D" };
+  const bar = barMap[interval] ?? interval;
+  const instId = toOkxSymbol(symbol);
+
+  const candles = [];
+  let after = "";
+  let remaining = limit;
+
+  while (remaining > 0) {
+    const batchSize = Math.min(remaining, 300);
+    const params = new URLSearchParams({ instId, bar, limit: batchSize });
+    if (after) params.set("after", after);
+    const res = await fetch(`https://www.okx.com/api/v5/market/candles?${params}`);
+    if (!res.ok) throw new Error(`OKX API error: ${res.status}`);
+    const json = await res.json();
+    if (json.code !== "0") throw new Error(`OKX error: ${json.msg}`);
+    const batch = json.data;
+    if (!batch || batch.length === 0) break;
+    candles.push(...batch);
+    remaining -= batch.length;
+    if (batch.length < batchSize) break;
+    after = batch[batch.length - 1][0];
+  }
+
+  // OKX returns newest-first → reverse to oldest-first
+  candles.reverse();
+
+  return candles.map((k) => ({
+    time: parseInt(k[0]),
     open: parseFloat(k[1]),
     high: parseFloat(k[2]),
     low: parseFloat(k[3]),
@@ -243,24 +271,31 @@ async function getSymbolData(symbol) {
 
 async function fetchMarketBrief() {
   try {
-    const [fngRes, globalRes, btcDailyRes] = await Promise.all([
+    const [fngRes, globalRes, btcDailyRes, tickerRes] = await Promise.all([
       fetch("https://api.alternative.me/fng/?limit=1"),
       fetch("https://api.coingecko.com/api/v3/global"),
-      fetch("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=30"),
+      fetch("https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1D&limit=30"),
+      fetch("https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT"),
     ]);
 
     const fng = await fngRes.json();
     const global = await globalRes.json();
-    const btcDaily = await btcDailyRes.json();
+    const btcDailyJson = await btcDailyRes.json();
+    const tickerJson = await tickerRes.json();
 
     const fngValue = parseInt(fng.data[0].value);
     const fngLabel = fng.data[0].value_classification;
     const dominance = global.data.market_cap_percentage.btc.toFixed(1);
 
-    const ticker = await fetch("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT").then(r => r.json());
-    const change24h = parseFloat(ticker.priceChangePercent);
-    const volume24h = parseFloat(ticker.quoteVolume) / 1e9;
+    // OKX ticker: data[0] = { last, open24h, volCcy24h, ... }
+    const ticker = tickerJson.data[0];
+    const lastPrice = parseFloat(ticker.last);
+    const open24h   = parseFloat(ticker.open24h);
+    const change24h = ((lastPrice - open24h) / open24h) * 100;
+    const volume24h = parseFloat(ticker.volCcy24h) / 1e9;  // in USDT billions (volCcy = quote vol)
 
+    // OKX returns newest-first, reverse for oldest-first
+    const btcDaily = (btcDailyJson.data ?? []).reverse();
     const recentCandles = btcDaily.slice(-14);
     const high14 = Math.max(...recentCandles.map(c => parseFloat(c[2])));
     const low14  = Math.min(...recentCandles.map(c => parseFloat(c[3])));
